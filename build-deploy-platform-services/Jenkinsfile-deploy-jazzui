@@ -1,0 +1,77 @@
+#!groovy
+
+node {
+	echo 'Hello World'
+
+	def var_credentialsId 			= env.REPO_CREDENTIAL_ID
+	def var_bitbucket_framework_url = "http://" + env.REPO_BASE + "/scm/" + env.REPO_CORE + "/"
+
+	checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: var_credentialsId, url: var_bitbucket_framework_url + 'build-deploy-platform-services.git']]])
+
+    sh "rm -rf jazz-ui"
+
+    dir('jazz-ui') {
+        checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: var_credentialsId, url: var_bitbucket_framework_url + 'jazz-ui.git']]])
+    }
+	
+	def cfid = ""
+	withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: env.AWS_CREDENTIAL_ID, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+		echo "AWS Configure ......."
+
+		sh "aws configure set profile.cloud-api.region ${env.jazz_region}"
+		sh "aws configure set profile.cloud-api.aws_access_key_id $AWS_ACCESS_KEY_ID"
+		sh "aws configure set profile.cloud-api.aws_secret_access_key $AWS_SECRET_ACCESS_KEY"
+		sh "aws configure set preview.cloudfront true"
+
+        cfid = getCFID();
+			
+		sh "chmod 777 jenkins-deploy-ui.sh"
+		//sh "./jenkins-deploy-ui.sh master $env.env_name_prefix $env.jazz_bucket_web $env.BUILD_ID $env.WEBSITE_PROD_S3BUCKET $env.CLOUDFRONT_ORIGIN_ID"
+		sh "./jenkins-deploy-ui.sh"
+
+        sh "pwd"
+        def bucket_name = env.jazz_bucket_web
+		sh "aws s3 ls $bucket_name"
+		echo "Starting to upload the files to the bucket................."
+		sh "aws s3 cp jazz-ui/dist s3://$bucket_name --recursive --include \"*\""
+		echo ".................Completed upload of files to the bucket"
+		sh "aws s3 ls $bucket_name"
+
+        invalidateCF(cfid);
+	}
+}
+
+def getCFID() {
+
+	try {
+		def cf_ldists = sh (script: "aws  cloudfront list-distributions --query \"DistributionList.Items[?Origins.Items[?Id=='$env.env_name_prefix-originid']].{Id: Id}\" --output json" ,
+							returnStdout: true
+						).trim()
+
+		echo "cf_ldists is $cf_ldists"
+		def configParser = new groovy.json.JsonSlurper()
+		def cfDists = configParser.parseText(cf_ldists)
+		echo "cfid::${cfDists[0].Id}"
+		return cfDists[0].Id
+	}catch(ex) {
+		error "Failed while updateEnableCompressConfig " + ex.toString()
+		return null;
+	}
+    
+}
+
+def invalidateCF(cfid) {
+    try {
+		def callerReference = "JazzWeb_"+env.BUILD_ID
+		def invalidate_config= "{\"Paths\":{\"Quantity\":1,\"Items\":[\"/*\"]},\"CallerReference\":\"$callerReference\"}"
+
+		def invalidateStatus = sh (script: "aws cloudfront create-invalidation --distribution-id $cfid --invalidation-batch '$invalidate_config' --output json" ,
+							returnStdout: true
+						).trim()
+		echo "Invalidated Cloud Front Cache for service..:$invalidateStatus"
+		
+	}catch(ex) {
+		error "Failed while updateEnableCompressConfig " + ex.toString()
+	}
+
+}
